@@ -51,8 +51,6 @@ class DocSourceManager:
         """
         self.config_path = Path(".gproj")
         self.config = self.load_config()
-        # Limit parallel operations to avoid overwhelming the system
-        self.semaphore = asyncio.Semaphore(5)
         self.cloned_repos = set()  # Track which repos we've already processed
 
     def load_config(self) -> Dict:
@@ -65,9 +63,7 @@ class DocSourceManager:
         """
         if not self.config_path.exists():
             return {
-                "project_name": "",
-                "repo_org": "",
-                "docs_base_path": "",  # Will be set by .gproj config
+                "docs_base_path": "~/.gproj/docs",
                 "documentation_sources": []
             }
         return json.loads(self.config_path.read_text())
@@ -88,75 +84,6 @@ class DocSourceManager:
         """
         return os.path.expandvars(os.path.expanduser(path))
 
-    def extract_org_repo(self, repo_url: str) -> tuple[str, str]:
-        """Extract organization and repository name from a repo URL or org/repo format.
-        
-        Handles formats:
-        - git@github.com:org/repo.git
-        - https://github.com/org/repo
-        - org/repo
-        
-        Returns:
-            tuple: (organization, repository_name)
-        """
-        if repo_url.startswith(('http://', 'https://')):
-            # Extract org/repo from HTTPS URL
-            match = re.search(r'https?://[^/]+/([^/]+)/([^/]+?)(?:\.git)?/?$', repo_url)
-            if not match:
-                raise ValueError(f"Invalid repository URL format: {repo_url}")
-            return match.group(1), match.group(2)
-        elif repo_url.startswith('git@'):
-            # Extract org/repo from SSH URL
-            match = re.search(r'git@[^:]+:([^/]+)/([^/]+?)(?:\.git)?/?$', repo_url)
-            if not match:
-                raise ValueError(f"Invalid SSH URL format: {repo_url}")
-            return match.group(1), match.group(2)
-        else:
-            # Handle plain org/repo format
-            if '/' not in repo_url:
-                raise ValueError("Repository must be in format 'org/repo' or a valid URL")
-            org, repo = repo_url.split('/', 1)
-            # Remove .git suffix if present
-            repo = re.sub(r'\.git$', '', repo)
-            return org, repo
-
-    def extract_repo_name(self, repo_url: str) -> str:
-        """Extract just the repository name from a URL or org/repo format.
-        
-        Handles:
-        - git@github.com:org/repo.git -> repo
-        - https://github.com/org/repo -> repo
-        - org/repo -> repo
-        
-        Returns:
-            str: Repository name without .git suffix
-        """
-        # Remove .git suffix if present
-        repo_url = re.sub(r'\.git$', '', repo_url)
-        
-        # Extract the last part after / or :
-        return repo_url.split('/')[-1].split(':')[-1]
-
-    def transform_doc_path(self, source: Dict) -> str:
-        """Transform documentation source path to storage location.
-        
-        Args:
-            source: Dictionary containing repository information
-                   Must include 'repo' key
-                   
-        Returns:
-            str: The full path where the repository should be stored
-        """
-        if not self.config.get("docs_base_path"):
-            print("❌ No docs_base_path specified in .gproj configuration")
-            sys.exit(1)
-            
-        base_path = self.expand_path(self.config["docs_base_path"])
-        repo_url = source.get("repo", "")
-        repo_name = self.extract_repo_name(repo_url)
-        
-        return str(Path(base_path) / repo_name)
-
     async def clone_doc_repo(self, source: Dict) -> bool:
         """Clone or update a documentation repository."""
         try:
@@ -172,7 +99,6 @@ class DocSourceManager:
             
             if repo_dir.exists():
                 print(f"Documentation repo {source['name']} exists, checking out {source.get('tag', 'main')}...")
-                # Just update the existing repo
                 process = await asyncio.create_subprocess_exec(
                     "git", "-C", str(repo_dir), "fetch", "--all",
                     stdout=asyncio.subprocess.PIPE,
@@ -191,31 +117,36 @@ class DocSourceManager:
             print(f"Cloning documentation repo {source['name']}...")
             repo_dir.parent.mkdir(parents=True, exist_ok=True)
 
-            # Try SSH first
-            clone_url = f"git@github.com:{source['repo']}.git"
+            # Extract repo org/name from URL if needed
+            repo_url = source["repo"]
+            if repo_url.startswith(('http://', 'https://')):
+                # Already a full URL, use as is but ensure no duplicate https://
+                clone_url = repo_url.replace('https://github.com/', '')
+                if clone_url.startswith('https://'):
+                    clone_url = clone_url[len('https://'):]
+                clone_url = f"https://github.com/{clone_url}"
+            else:
+                # Convert from org/repo format
+                clone_url = f"https://github.com/{repo_url}"
+
+            # Remove .git suffix if present
+            clone_url = re.sub(r'\.git$', '', clone_url)
+            
+            # Add .git suffix for cloning
+            clone_url = f"{clone_url}.git"
+
             process = await asyncio.create_subprocess_exec(
-                "git", "clone", "--depth", "1", 
+                "git", "clone", "--depth", "1",
                 "-b", source.get("tag", "main"),
                 clone_url, str(repo_dir),
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE
             )
             _, stderr = await process.communicate()
-
+            
             if process.returncode != 0:
-                # Fall back to HTTPS if SSH fails
-                clone_url = f"https://github.com/{source['repo']}.git"
-                process = await asyncio.create_subprocess_exec(
-                    "git", "clone", "--depth", "1",
-                    "-b", source.get("tag", "main"),
-                    clone_url, str(repo_dir),
-                    stdout=asyncio.subprocess.PIPE,
-                    stderr=asyncio.subprocess.PIPE
-                )
-                _, stderr = await process.communicate()
-                if process.returncode != 0:
-                    print(f"❌ Failed to clone {source['name']}: {stderr.decode()}")
-                    return False
+                print(f"❌ Failed to clone {source['name']}: {stderr.decode()}")
+                return False
 
             return True
         except Exception as e:
@@ -234,18 +165,15 @@ class DocSourceManager:
         if not self.config.get("documentation_sources"):
             return
         print("\nProcessing documentation sources...")
-        base_path = Path(self.expand_path(self.config["docs_base_path"]))
-        base_path.mkdir(parents=True, exist_ok=True)
         
-        # Create tasks for all documentation sources
         tasks = []
         for source in self.config["documentation_sources"]:
             tasks.append(self.clone_doc_repo(source))
         
-        # Run all tasks and check results
         results = await asyncio.gather(*tasks)
-        success = all(results)
-        print("✅ Documentation sources processed" if success else "❌ Some documentation sources failed")
+        failed = len([r for r in results if not r])
+        if failed:
+            print(f"❌ {failed} documentation source(s) failed to process")
 
 class ProjectInitializer:
     """
@@ -290,11 +218,9 @@ class ProjectInitializer:
 
     async def clone_repo(self, repo: Dict[str, str]) -> bool:
         """Clone or update a project repository."""
+        repo_name = repo["name"]  # Move this outside the try block
         try:
             async with self.semaphore:
-                repo_name = repo["name"]
-                repo_org = repo.get("org", self.repo_org)
-                repo_host = repo.get("host", self.github_host)
                 repo_dir = self.base_dir / repo_name
                 
                 if repo_dir.exists():
@@ -308,7 +234,7 @@ class ProjectInitializer:
                 else:
                     print(f"Cloning repository {repo_name}...")
                     # Try SSH first
-                    ssh_url = f"git@{repo_host}:{repo_org}/{repo_name}.git"
+                    ssh_url = f"git@{self.github_host}:{self.repo_org}/{repo_name}.git"
                     process = await asyncio.create_subprocess_exec(
                         "git", "clone", ssh_url, str(repo_dir),
                         stdout=asyncio.subprocess.PIPE,
@@ -319,7 +245,7 @@ class ProjectInitializer:
                         # If SSH fails, try HTTPS
                         if "Permission denied (publickey)" in stderr.decode():
                             print("SSH authentication failed, trying HTTPS...")
-                            https_url = f"https://{repo_host}/{repo_org}/{repo_name}.git"
+                            https_url = f"https://{self.github_host}/{self.repo_org}/{repo_name}.git"
                             process = await asyncio.create_subprocess_exec(
                                 "git", "clone", https_url, str(repo_dir),
                                 stdout=asyncio.subprocess.PIPE,
@@ -338,32 +264,27 @@ class ProjectInitializer:
             return False
 
     async def backup_repo(self, repo: Dict[str, str]) -> bool:
-        """
-        Create a backup branch for a repository before making big changes.
-        
-        This function:
-        1. Creates a new branch with a timestamp
-        2. Pushes the branch to the remote repository
-        3. Removes the local repository
-        
-        Args:
-            repo: Dictionary with repository details
-            
-        Returns:
-            bool: True if successful, False if there was an error
-        """
+        """Create a backup branch for a repository before removing it."""
+        repo_name = repo["name"]
+        repo_dir = self.base_dir / repo_name
         try:
-            async with self.semaphore:
-                repo_name = repo["name"]
-                repo_dir = self.base_dir / repo_name
-                if not repo_dir.exists():
-                    return True
+            if not repo_dir.exists():
+                return True
 
-                print(f"Creating backup branch for {repo_name}...")
-                # Create a branch name with current timestamp
-                backup_branch = f"backup_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
-                
-                # Create and push the backup branch
+            print(f"Nuking repository {repo_name}...")
+            if not repo_dir.is_dir():
+                return True
+
+            # Don't try to backup if it's not a git repo
+            if not (repo_dir / ".git").exists():
+                shutil.rmtree(repo_dir)
+                return True
+
+            # Create a branch name with current timestamp
+            backup_branch = f"backup_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+            
+            # Try to create and push backup branch, but don't fail if it doesn't work
+            try:
                 process = await asyncio.create_subprocess_exec(
                     "git", "-C", str(repo_dir), "checkout", "-b", backup_branch,
                     stdout=asyncio.subprocess.PIPE,
@@ -377,31 +298,31 @@ class ProjectInitializer:
                     stderr=asyncio.subprocess.PIPE
                 )
                 await process.communicate()
-                
-                # Remove the local repository
-                shutil.rmtree(repo_dir)
-                return True
+            except Exception as e:
+                print(f"Warning: Failed to create backup branch for {repo_name}: {str(e)}")
+            
+            # Remove the repository regardless of backup success
+            print(f"Removing repository {repo_name}...")
+            shutil.rmtree(repo_dir)
+            return True
+
         except Exception as e:
-            print(f"❌ Error backing up {repo_name}: {str(e)}")
+            print(f"❌ Error processing {repo_name}: {str(e)}")
+            # Try to remove the repo even if we hit an error
+            try:
+                if repo_dir.exists():
+                    shutil.rmtree(repo_dir)
+            except Exception:
+                pass
             return False
 
     async def run(self, nuke: bool = False) -> None:
-        """
-        Run the main repository operations.
-        
-        This function either:
-        1. Clones/updates repositories (normal mode)
-        2. Creates backups and removes repositories (nuke mode)
-        
-        Args:
-            nuke: If True, backup and remove repositories. If False, clone/update.
-        """
+        """Run initialization or nuke operation"""
         # First handle documentation repositories
         doc_manager = DocSourceManager()
         await doc_manager.process_doc_sources()
 
         print(f"\n{'Nuking' if nuke else 'Initializing'} repositories...")
-        # Create tasks for all repositories
         tasks = []
         for repo in self.repositories:
             if nuke:
@@ -409,11 +330,17 @@ class ProjectInitializer:
             else:
                 tasks.append(self.clone_repo(repo))
 
-        # Run all tasks and check results
-        results = await asyncio.gather(*tasks)
-        success = all(results)
+        # Process repos in parallel but limit concurrent operations
+        chunk_size = 5  # Process 5 repos at a time
+        for i in range(0, len(tasks), chunk_size):
+            chunk = tasks[i:i + chunk_size]
+            results = await asyncio.gather(*chunk)
+            for repo, success in zip(self.repositories[i:i + chunk_size], results):
+                if not success:
+                    print(f"❌ Failed to process {repo['name']}")
+
         action = "nuked" if nuke else "initialized"
-        print(f"✅ Repositories {action}" if success else f"❌ Some repositories failed to be {action}")
+        print(f"\n✅ Repository operations completed")
 
 async def handle_git_operations(initializer: ProjectInitializer, args: argparse.Namespace) -> None:
     """
