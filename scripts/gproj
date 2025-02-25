@@ -53,6 +53,7 @@ class DocSourceManager:
         self.config = self.load_config()
         # Limit parallel operations to avoid overwhelming the system
         self.semaphore = asyncio.Semaphore(5)
+        self.cloned_repos = set()  # Track which repos we've already processed
 
     def load_config(self) -> Dict:
         """
@@ -159,69 +160,66 @@ class DocSourceManager:
     async def clone_doc_repo(self, source: Dict) -> bool:
         """Clone or update a documentation repository."""
         try:
-            repo_dir = Path(self.transform_doc_path(source))
-            repo_url = source["repo"]
+            base_path = self.expand_path(self.config.get("docs_base_path", "~/.gproj/docs"))
+            repo_dir = Path(base_path) / source["name"]
+
+            # Skip if we've already processed this repo
+            if source["repo"] in self.cloned_repos:
+                print(f" Skipping {source['name']}, already processed")
+                return True
             
-            # If it's just org/repo format, convert to SSH URL
-            if not any(repo_url.startswith(prefix) for prefix in ('http://', 'https://', 'git@')):
-                repo_url = f"git@github.com:{repo_url}.git"
+            self.cloned_repos.add(source["repo"])
             
             if repo_dir.exists():
-                print(f"Documentation repo {repo_dir.name} exists, updating...")
+                print(f"Documentation repo {source['name']} exists, checking out {source.get('tag', 'main')}...")
+                # Just update the existing repo
                 process = await asyncio.create_subprocess_exec(
                     "git", "-C", str(repo_dir), "fetch", "--all",
                     stdout=asyncio.subprocess.PIPE,
                     stderr=asyncio.subprocess.PIPE
                 )
                 await process.communicate()
+                
                 process = await asyncio.create_subprocess_exec(
                     "git", "-C", str(repo_dir), "checkout", source.get("tag", "main"),
                     stdout=asyncio.subprocess.PIPE,
                     stderr=asyncio.subprocess.PIPE
                 )
                 await process.communicate()
-            else:
-                print(f"Cloning documentation repo {repo_dir.name}...")
-                repo_dir.parent.mkdir(parents=True, exist_ok=True)
+                return True
+
+            print(f"Cloning documentation repo {source['name']}...")
+            repo_dir.parent.mkdir(parents=True, exist_ok=True)
+
+            # Try SSH first
+            clone_url = f"git@github.com:{source['repo']}.git"
+            process = await asyncio.create_subprocess_exec(
+                "git", "clone", "--depth", "1", 
+                "-b", source.get("tag", "main"),
+                clone_url, str(repo_dir),
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE
+            )
+            _, stderr = await process.communicate()
+
+            if process.returncode != 0:
+                # Fall back to HTTPS if SSH fails
+                clone_url = f"https://github.com/{source['repo']}.git"
                 process = await asyncio.create_subprocess_exec(
-                    "git", "clone", repo_url, str(repo_dir),
+                    "git", "clone", "--depth", "1",
+                    "-b", source.get("tag", "main"),
+                    clone_url, str(repo_dir),
                     stdout=asyncio.subprocess.PIPE,
                     stderr=asyncio.subprocess.PIPE
                 )
                 _, stderr = await process.communicate()
                 if process.returncode != 0:
-                    # If SSH fails, fall back to HTTPS
-                    if "Permission denied (publickey)" in stderr.decode():
-                        print("SSH authentication failed, trying HTTPS...")
-                        # Convert to HTTPS URL if needed
-                        if repo_url.startswith('git@'):
-                            repo_url = re.sub(r'git@([^:]+):', r'https://\1/', repo_url)
-                        if not repo_url.startswith(('http://', 'https://')):
-                            repo_url = f"https://github.com/{repo_url}"
-                        process = await asyncio.create_subprocess_exec(
-                            "git", "clone", repo_url, str(repo_dir),
-                            stdout=asyncio.subprocess.PIPE,
-                            stderr=asyncio.subprocess.PIPE
-                        )
-                        _, stderr = await process.communicate()
-                        if process.returncode != 0:
-                            print(f"❌ Failed to clone {repo_dir.name}: {stderr.decode()}")
-                            return False
-                    else:
-                        print(f"❌ Failed to clone {repo_dir.name}: {stderr.decode()}")
-                        return False
-                
-                if source.get("tag"):
-                    process = await asyncio.create_subprocess_exec(
-                        "git", "-C", str(repo_dir), "checkout", source["tag"],
-                        stdout=asyncio.subprocess.PIPE,
-                        stderr=asyncio.subprocess.PIPE
-                    )
-                    await process.communicate()
+                    print(f"❌ Failed to clone {source['name']}: {stderr.decode()}")
+                    return False
 
             return True
         except Exception as e:
-            print(f"❌ Error processing {repo_dir.name if 'repo_dir' in locals() else source.get('name', 'unknown')}: {str(e)}")
+            print(f"❌ Error processing {source.get('name', 'unknown')}: {str(e)}")
             return False
 
     async def process_doc_sources(self) -> None:
