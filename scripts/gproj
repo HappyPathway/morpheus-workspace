@@ -1,0 +1,546 @@
+#!/usr/bin/env python3
+"""
+Project Git Repository Management Script
+
+This script helps manage multiple Git repositories in a project workspace. It can:
+1. Clone or update repositories from GitHub (or other Git hosts)
+2. Create backup branches before making big changes
+3. Handle Git operations (like commit and push) across multiple repositories
+4. Clone documentation repositories to a special folder
+
+The script expects a .gproj configuration file in the current directory. This file
+should contain:
+- project_name: The name of your project
+- repo_org: The name of your GitHub organization
+- repositories: A list of repositories to manage
+
+Example usage:
+  ./gproj                     # Clone/update all repositories
+  ./gproj --nuke             # Create backups and remove repositories
+  ./gproj --debug            # Show configuration details
+"""
+import argparse              # For handling command line arguments
+import asyncio              # For running Git operations in parallel
+import json                 # For reading/writing JSON configuration
+import os                   # For file and path operations
+import sys                 # For system operations like exit()
+import shutil              # For file/directory operations
+import re                   # Added for URL regex
+from datetime import datetime
+from pathlib import Path    # For better path handling
+from typing import List, Dict, Union  # For type hints
+
+class DocSourceManager:
+    """
+    Manages documentation source repositories.
+    
+    This class handles cloning and updating documentation repositories. These are
+    stored in a special folder (usually ~/.gproj/docs) and can be organized by
+    organization and repository name.
+
+    The documentation repositories are different from the main project repositories.
+    They are typically used for reference material, guides, or shared documentation.
+    """
+
+    def __init__(self):
+        """
+        Set up the documentation manager.
+        
+        Looks for a .gproj configuration file and sets up default paths for
+        documentation storage.
+        """
+        self.config_path = Path(".gproj")
+        self.config = self.load_config()
+        # Limit parallel operations to avoid overwhelming the system
+        self.semaphore = asyncio.Semaphore(5)
+
+    def load_config(self) -> Dict:
+        """
+        Load the .gproj configuration file.
+        
+        Returns:
+            Dict: Configuration settings with default values if file doesn't exist.
+                 Always includes a docs_base_path setting.
+        """
+        if not self.config_path.exists():
+            return {
+                "project_name": "",
+                "repo_org": "",
+                "docs_base_path": "",  # Will be set by .gproj config
+                "documentation_sources": []
+            }
+        return json.loads(self.config_path.read_text())
+
+    def expand_path(self, path: str) -> str:
+        """
+        Convert a path with special characters into a full system path.
+        
+        This handles:
+        - ~ for home directory
+        - Environment variables like $HOME
+        
+        Args:
+            path: A path string that might contain ~ or environment variables
+            
+        Returns:
+            str: The full system path with all special characters expanded
+        """
+        return os.path.expandvars(os.path.expanduser(path))
+
+    def extract_org_repo(self, repo_url: str) -> tuple[str, str]:
+        """Extract organization and repository name from a repo URL or org/repo format.
+        
+        Handles formats:
+        - git@github.com:org/repo.git
+        - https://github.com/org/repo
+        - org/repo
+        
+        Returns:
+            tuple: (organization, repository_name)
+        """
+        if repo_url.startswith(('http://', 'https://')):
+            # Extract org/repo from HTTPS URL
+            match = re.search(r'https?://[^/]+/([^/]+)/([^/]+?)(?:\.git)?/?$', repo_url)
+            if not match:
+                raise ValueError(f"Invalid repository URL format: {repo_url}")
+            return match.group(1), match.group(2)
+        elif repo_url.startswith('git@'):
+            # Extract org/repo from SSH URL
+            match = re.search(r'git@[^:]+:([^/]+)/([^/]+?)(?:\.git)?/?$', repo_url)
+            if not match:
+                raise ValueError(f"Invalid SSH URL format: {repo_url}")
+            return match.group(1), match.group(2)
+        else:
+            # Handle plain org/repo format
+            if '/' not in repo_url:
+                raise ValueError("Repository must be in format 'org/repo' or a valid URL")
+            org, repo = repo_url.split('/', 1)
+            # Remove .git suffix if present
+            repo = re.sub(r'\.git$', '', repo)
+            return org, repo
+
+    def extract_repo_name(self, repo_url: str) -> str:
+        """Extract just the repository name from a URL or org/repo format.
+        
+        Handles:
+        - git@github.com:org/repo.git -> repo
+        - https://github.com/org/repo -> repo
+        - org/repo -> repo
+        
+        Returns:
+            str: Repository name without .git suffix
+        """
+        # Remove .git suffix if present
+        repo_url = re.sub(r'\.git$', '', repo_url)
+        
+        # Extract the last part after / or :
+        return repo_url.split('/')[-1].split(':')[-1]
+
+    def transform_doc_path(self, source: Dict) -> str:
+        """Transform documentation source path to storage location.
+        
+        Args:
+            source: Dictionary containing repository information
+                   Must include 'repo' key
+                   
+        Returns:
+            str: The full path where the repository should be stored
+        """
+        if not self.config.get("docs_base_path"):
+            print("❌ No docs_base_path specified in .gproj configuration")
+            sys.exit(1)
+            
+        base_path = self.expand_path(self.config["docs_base_path"])
+        repo_url = source.get("repo", "")
+        repo_name = self.extract_repo_name(repo_url)
+        
+        return str(Path(base_path) / repo_name)
+
+    async def clone_doc_repo(self, source: Dict) -> bool:
+        """Clone or update a documentation repository."""
+        try:
+            repo_dir = Path(self.transform_doc_path(source))
+            repo_url = source["repo"]
+            
+            # If it's just org/repo format, convert to SSH URL
+            if not any(repo_url.startswith(prefix) for prefix in ('http://', 'https://', 'git@')):
+                repo_url = f"git@github.com:{repo_url}.git"
+            
+            if repo_dir.exists():
+                print(f"Documentation repo {repo_dir.name} exists, updating...")
+                process = await asyncio.create_subprocess_exec(
+                    "git", "-C", str(repo_dir), "fetch", "--all",
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE
+                )
+                await process.communicate()
+                process = await asyncio.create_subprocess_exec(
+                    "git", "-C", str(repo_dir), "checkout", source.get("tag", "main"),
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE
+                )
+                await process.communicate()
+            else:
+                print(f"Cloning documentation repo {repo_dir.name}...")
+                repo_dir.parent.mkdir(parents=True, exist_ok=True)
+                process = await asyncio.create_subprocess_exec(
+                    "git", "clone", repo_url, str(repo_dir),
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE
+                )
+                _, stderr = await process.communicate()
+                if process.returncode != 0:
+                    # If SSH fails, fall back to HTTPS
+                    if "Permission denied (publickey)" in stderr.decode():
+                        print("SSH authentication failed, trying HTTPS...")
+                        # Convert to HTTPS URL if needed
+                        if repo_url.startswith('git@'):
+                            repo_url = re.sub(r'git@([^:]+):', r'https://\1/', repo_url)
+                        if not repo_url.startswith(('http://', 'https://')):
+                            repo_url = f"https://github.com/{repo_url}"
+                        process = await asyncio.create_subprocess_exec(
+                            "git", "clone", repo_url, str(repo_dir),
+                            stdout=asyncio.subprocess.PIPE,
+                            stderr=asyncio.subprocess.PIPE
+                        )
+                        _, stderr = await process.communicate()
+                        if process.returncode != 0:
+                            print(f"❌ Failed to clone {repo_dir.name}: {stderr.decode()}")
+                            return False
+                    else:
+                        print(f"❌ Failed to clone {repo_dir.name}: {stderr.decode()}")
+                        return False
+                
+                if source.get("tag"):
+                    process = await asyncio.create_subprocess_exec(
+                        "git", "-C", str(repo_dir), "checkout", source["tag"],
+                        stdout=asyncio.subprocess.PIPE,
+                        stderr=asyncio.subprocess.PIPE
+                    )
+                    await process.communicate()
+
+            return True
+        except Exception as e:
+            print(f"❌ Error processing {repo_dir.name if 'repo_dir' in locals() else source.get('name', 'unknown')}: {str(e)}")
+            return False
+
+    async def process_doc_sources(self) -> None:
+        """
+        Process all documentation repositories in parallel.
+        
+        This function:
+        1. Creates the base documentation directory if needed
+        2. Processes all documentation sources in the configuration
+        3. Reports success or failure
+        """
+        if not self.config.get("documentation_sources"):
+            return
+        print("\nProcessing documentation sources...")
+        base_path = Path(self.expand_path(self.config["docs_base_path"]))
+        base_path.mkdir(parents=True, exist_ok=True)
+        
+        # Create tasks for all documentation sources
+        tasks = []
+        for source in self.config["documentation_sources"]:
+            tasks.append(self.clone_doc_repo(source))
+        
+        # Run all tasks and check results
+        results = await asyncio.gather(*tasks)
+        success = all(results)
+        print("✅ Documentation sources processed" if success else "❌ Some documentation sources failed")
+
+class ProjectInitializer:
+    """
+    Handles initialization and management of project repositories.
+    
+    This class is responsible for:
+    1. Reading project configuration
+    2. Cloning/updating project repositories
+    3. Creating backup branches when needed
+    4. Managing Git operations across repositories
+    """
+
+    def __init__(self):
+        """
+        Set up the project initializer.
+        
+        Reads the .gproj configuration and validates that all required
+        settings are present. Will exit the program if configuration is missing
+        or invalid.
+        """
+        # Check for configuration file
+        self.config_path = Path(".gproj")
+        if not self.config_path.exists():
+            print("❌ No .gproj configuration file found")
+            sys.exit(1)
+        
+        # Load and validate configuration
+        config = json.loads(self.config_path.read_text())
+        self.project_name = config.get("project_name")
+        self.repo_org = config.get("repo_org")
+        self.github_host = config.get("github_host", "github.com")
+        self.repositories = config.get("repositories", [])
+        
+        # Make sure we have all required settings
+        if not all([self.project_name, self.repo_org, self.repositories]):
+            print("❌ Missing required configuration in .gproj file")
+            sys.exit(1)
+            
+        # Set up paths and limits
+        self.base_dir = Path("..").resolve()
+        self.semaphore = asyncio.Semaphore(5)
+
+    async def clone_repo(self, repo: Dict[str, str]) -> bool:
+        """Clone or update a project repository."""
+        try:
+            async with self.semaphore:
+                repo_name = repo["name"]
+                repo_org = repo.get("org", self.repo_org)
+                repo_host = repo.get("host", self.github_host)
+                repo_dir = self.base_dir / repo_name
+                
+                if repo_dir.exists():
+                    print(f"Repository {repo_name} exists, fetching updates...")
+                    process = await asyncio.create_subprocess_exec(
+                        "git", "-C", str(repo_dir), "fetch", "--all",
+                        stdout=asyncio.subprocess.PIPE,
+                        stderr=asyncio.subprocess.PIPE
+                    )
+                    await process.communicate()
+                else:
+                    print(f"Cloning repository {repo_name}...")
+                    # Try SSH first
+                    ssh_url = f"git@{repo_host}:{repo_org}/{repo_name}.git"
+                    process = await asyncio.create_subprocess_exec(
+                        "git", "clone", ssh_url, str(repo_dir),
+                        stdout=asyncio.subprocess.PIPE,
+                        stderr=asyncio.subprocess.PIPE
+                    )
+                    _, stderr = await process.communicate()
+                    if process.returncode != 0:
+                        # If SSH fails, try HTTPS
+                        if "Permission denied (publickey)" in stderr.decode():
+                            print("SSH authentication failed, trying HTTPS...")
+                            https_url = f"https://{repo_host}/{repo_org}/{repo_name}.git"
+                            process = await asyncio.create_subprocess_exec(
+                                "git", "clone", https_url, str(repo_dir),
+                                stdout=asyncio.subprocess.PIPE,
+                                stderr=asyncio.subprocess.PIPE
+                            )
+                            _, stderr = await process.communicate()
+                            if process.returncode != 0:
+                                print(f"❌ Failed to clone {repo_name}: {stderr.decode()}")
+                                return False
+                        else:
+                            print(f"❌ Failed to clone {repo_name}: {stderr.decode()}")
+                            return False
+                return True
+        except Exception as e:
+            print(f"❌ Error processing {repo_name}: {str(e)}")
+            return False
+
+    async def backup_repo(self, repo: Dict[str, str]) -> bool:
+        """
+        Create a backup branch for a repository before making big changes.
+        
+        This function:
+        1. Creates a new branch with a timestamp
+        2. Pushes the branch to the remote repository
+        3. Removes the local repository
+        
+        Args:
+            repo: Dictionary with repository details
+            
+        Returns:
+            bool: True if successful, False if there was an error
+        """
+        try:
+            async with self.semaphore:
+                repo_name = repo["name"]
+                repo_dir = self.base_dir / repo_name
+                if not repo_dir.exists():
+                    return True
+
+                print(f"Creating backup branch for {repo_name}...")
+                # Create a branch name with current timestamp
+                backup_branch = f"backup_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+                
+                # Create and push the backup branch
+                process = await asyncio.create_subprocess_exec(
+                    "git", "-C", str(repo_dir), "checkout", "-b", backup_branch,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE
+                )
+                await process.communicate()
+                
+                process = await asyncio.create_subprocess_exec(
+                    "git", "-C", str(repo_dir), "push", "origin", backup_branch,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE
+                )
+                await process.communicate()
+                
+                # Remove the local repository
+                shutil.rmtree(repo_dir)
+                return True
+        except Exception as e:
+            print(f"❌ Error backing up {repo_name}: {str(e)}")
+            return False
+
+    async def run(self, nuke: bool = False) -> None:
+        """
+        Run the main repository operations.
+        
+        This function either:
+        1. Clones/updates repositories (normal mode)
+        2. Creates backups and removes repositories (nuke mode)
+        
+        Args:
+            nuke: If True, backup and remove repositories. If False, clone/update.
+        """
+        # First handle documentation repositories
+        doc_manager = DocSourceManager()
+        await doc_manager.process_doc_sources()
+
+        print(f"\n{'Nuking' if nuke else 'Initializing'} repositories...")
+        # Create tasks for all repositories
+        tasks = []
+        for repo in self.repositories:
+            if nuke:
+                tasks.append(self.backup_repo(repo))
+            else:
+                tasks.append(self.clone_repo(repo))
+
+        # Run all tasks and check results
+        results = await asyncio.gather(*tasks)
+        success = all(results)
+        action = "nuked" if nuke else "initialized"
+        print(f"✅ Repositories {action}" if success else f"❌ Some repositories failed to be {action}")
+
+async def handle_git_operations(initializer: ProjectInitializer, args: argparse.Namespace) -> None:
+    """
+    Handle Git commit and push operations across repositories.
+    
+    This function can:
+    1. Add specific files or all changes
+    2. Commit changes with a message
+    3. Push changes to a specific branch
+    
+    Args:
+        initializer: The ProjectInitializer instance
+        args: Command line arguments containing:
+             - exclude: List of repositories to skip
+             - commit: Whether to commit changes
+             - push: Whether to push changes
+             - files: Specific files to add
+             - message: Commit message
+             - branch: Branch to push to
+    """
+    excluded_repos = set(args.exclude or [])
+    base_dir = initializer.base_dir
+    
+    for repo in initializer.repositories:
+        repo_name = repo["name"]
+        # Skip excluded repositories
+        if repo_name in excluded_repos:
+            continue
+            
+        repo_dir = base_dir / repo_name
+        if not repo_dir.exists():
+            continue
+            
+        try:
+            # Handle commit operation
+            if args.commit:
+                print(f"\nCommitting changes in {repo_name}...")
+                # Add specified files or all changes
+                if args.files:
+                    for file in args.files:
+                        process = await asyncio.create_subprocess_exec(
+                            "git", "-C", str(repo_dir), "add", file,
+                            stdout=asyncio.subprocess.PIPE,
+                            stderr=asyncio.subprocess.PIPE
+                        )
+                        await process.communicate()
+                else:
+                    process = await asyncio.create_subprocess_exec(
+                        "git", "-C", str(repo_dir), "add", ".",
+                        stdout=asyncio.subprocess.PIPE,
+                        stderr=asyncio.subprocess.PIPE
+                    )
+                    await process.communicate()
+                
+                # Commit changes
+                process = await asyncio.create_subprocess_exec(
+                    "git", "-C", str(repo_dir), "commit", "-m", args.message,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE
+                )
+                await process.communicate()
+            
+            # Handle push operation
+            if args.push:
+                print(f"\nPushing changes in {repo_name}...")
+                cmd = ["git", "-C", str(repo_dir), "push"]
+                if args.branch:
+                    cmd.extend(["origin", args.branch])
+                process = await asyncio.create_subprocess_exec(
+                    *cmd,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE
+                )
+                await process.communicate()
+                
+        except Exception as e:
+            print(f"❌ Error processing {repo_name}: {str(e)}")
+
+def main():
+    """
+    Main entry point for the script.
+    
+    Sets up command line arguments and runs the appropriate operations based on
+    the provided arguments.
+    """
+    # Set up command line argument parser
+    parser = argparse.ArgumentParser(
+        description="Initialize or nuke project workspace",
+        epilog="Example: ./gproj --nuke  # Backup and remove all repositories"
+    )
+    parser.add_argument("--debug", action="store_true", help="Enable debug output")
+    parser.add_argument("--nuke", action="store_true", 
+                       help="Remove all repositories (after creating backup branches)")
+    parser.add_argument("--branch", help="Branch name for push operation")
+    parser.add_argument("--exclude", nargs="+", 
+                       help="Exclude specific repositories")
+    parser.add_argument("--commit", action="store_true",
+                       help="Commit changes in repositories")
+    parser.add_argument("--push", action="store_true",
+                       help="Push changes to remote repositories")
+    parser.add_argument("--message", "-m",
+                       help="Commit message when using --commit")
+    parser.add_argument("--files", nargs="+",
+                       help="Specific files to commit when using --commit")
+    
+    args = parser.parse_args()
+    initializer = ProjectInitializer()
+
+    # Show debug information if requested
+    if args.debug:
+        print("Configuration:")
+        print(json.dumps({
+            "project_name": initializer.project_name,
+            "repo_org": initializer.repo_org,
+            "repositories": initializer.repositories
+        }, indent=2))
+
+    # Handle Git operations if specified
+    if args.commit or args.push:
+        if args.commit and not args.message:
+            print("❌ --message is required for commit operation")
+            sys.exit(1)
+        asyncio.run(handle_git_operations(initializer, args))
+    else:
+        asyncio.run(initializer.run(args.nuke))
+
+if __name__ == "__main__":
+    main()
