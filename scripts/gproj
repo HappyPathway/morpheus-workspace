@@ -342,6 +342,57 @@ class ProjectInitializer:
         action = "nuked" if nuke else "initialized"
         print(f"\n✅ Repository operations completed")
 
+async def get_repo_status(repo_dir: str) -> Dict[str, List[str]]:
+    """Get the status of files in a repository."""
+    status = {"added": [], "modified": [], "deleted": []}
+    
+    # Get staged changes
+    process = await asyncio.create_subprocess_exec(
+        "git", "-C", str(repo_dir), "diff", "--cached", "--name-status",
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE
+    )
+    stdout, _ = await process.communicate()
+    for line in stdout.decode().splitlines():
+        if not line.strip():
+            continue
+        status_code, file = line.split(maxsplit=1)
+        if status_code.startswith('A'):
+            status["added"].append(file)
+        elif status_code.startswith('M'):
+            status["modified"].append(file)
+        elif status_code.startswith('D'):
+            status["deleted"].append(file)
+    
+    # Get unstaged changes
+    process = await asyncio.create_subprocess_exec(
+        "git", "-C", str(repo_dir), "diff", "--name-status",
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE
+    )
+    stdout, _ = await process.communicate()
+    for line in stdout.decode().splitlines():
+        if not line.strip():
+            continue
+        status_code, file = line.split(maxsplit=1)
+        if status_code.startswith('M') and file not in status["modified"]:
+            status["modified"].append(file)
+        elif status_code.startswith('D') and file not in status["deleted"]:
+            status["deleted"].append(file)
+    
+    # Get untracked files
+    process = await asyncio.create_subprocess_exec(
+        "git", "-C", str(repo_dir), "ls-files", "--others", "--exclude-standard",
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE
+    )
+    stdout, _ = await process.communicate()
+    for line in stdout.decode().splitlines():
+        if line.strip() and line not in status["added"]:
+            status["added"].append(line)
+    
+    return status
+
 async def handle_git_operations(initializer: ProjectInitializer, args: argparse.Namespace) -> None:
     """
     Handle Git commit and push operations across repositories.
@@ -375,9 +426,32 @@ async def handle_git_operations(initializer: ProjectInitializer, args: argparse.
             continue
             
         try:
+            # Show repository status before operations
+            print(f"\n📁 Repository: {repo_name}")
+            status = await get_repo_status(str(repo_dir))
+            
+            if not any(status.values()):
+                print("  No changes detected")
+                continue
+                
+            if status["added"]:
+                print("\n  📝 New files:")
+                for file in status["added"]:
+                    print(f"    + {file}")
+                    
+            if status["modified"]:
+                print("\n  🔄 Modified files:")
+                for file in status["modified"]:
+                    print(f"    * {file}")
+                    
+            if status["deleted"]:
+                print("\n  🗑️  Deleted files:")
+                for file in status["deleted"]:
+                    print(f"    - {file}")
+            
             # Handle commit operation
             if args.commit:
-                print(f"\nCommitting changes in {repo_name}...")
+                print(f"\n  💾 Committing changes...")
                 # Add specified files or all changes
                 if args.files:
                     for file in args.files:
@@ -405,7 +479,7 @@ async def handle_git_operations(initializer: ProjectInitializer, args: argparse.
             
             # Handle push operation
             if args.push:
-                print(f"\nPushing changes in {repo_name}...")
+                print(f"\n  ⬆️  Pushing changes...")
                 cmd = ["git", "-C", str(repo_dir), "push"]
                 if args.branch:
                     cmd.extend(["origin", args.branch])
