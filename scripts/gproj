@@ -43,24 +43,13 @@ class DocSourceManager:
     """
 
     def __init__(self):
-        """
-        Set up the documentation manager.
-        
-        Looks for a .gproj configuration file and sets up default paths for
-        documentation storage.
-        """
+        """Set up the documentation manager with configuration and repo tracking."""
         self.config_path = Path(".gproj")
         self.config = self.load_config()
         self.cloned_repos = set()  # Track which repos we've already processed
 
     def load_config(self) -> Dict:
-        """
-        Load the .gproj configuration file.
-        
-        Returns:
-            Dict: Configuration settings with default values if file doesn't exist.
-                 Always includes a docs_base_path setting.
-        """
+        """Load the .gproj configuration file with defaults."""
         if not self.config_path.exists():
             return {
                 "docs_base_path": "~/.gproj/docs",
@@ -69,19 +58,7 @@ class DocSourceManager:
         return json.loads(self.config_path.read_text())
 
     def expand_path(self, path: str) -> str:
-        """
-        Convert a path with special characters into a full system path.
-        
-        This handles:
-        - ~ for home directory
-        - Environment variables like $HOME
-        
-        Args:
-            path: A path string that might contain ~ or environment variables
-            
-        Returns:
-            str: The full system path with all special characters expanded
-        """
+        """Convert a path with special characters into a full system path."""
         return os.path.expandvars(os.path.expanduser(path))
 
     async def clone_doc_repo(self, source: Dict) -> bool:
@@ -154,14 +131,7 @@ class DocSourceManager:
             return False
 
     async def process_doc_sources(self) -> None:
-        """
-        Process all documentation repositories in parallel.
-        
-        This function:
-        1. Creates the base documentation directory if needed
-        2. Processes all documentation sources in the configuration
-        3. Reports success or failure
-        """
+        """Process all documentation repositories in parallel with error tracking."""
         if not self.config.get("documentation_sources"):
             return
         print("\nProcessing documentation sources...")
@@ -187,14 +157,7 @@ class ProjectInitializer:
     """
 
     def __init__(self):
-        """
-        Set up the project initializer.
-        
-        Reads the .gproj configuration and validates that all required
-        settings are present. Will exit the program if configuration is missing
-        or invalid.
-        """
-        # Check for configuration file
+        """Set up the project initializer with improved configuration handling."""
         self.config_path = Path(".gproj")
         if not self.config_path.exists():
             print("❌ No .gproj configuration file found")
@@ -204,17 +167,22 @@ class ProjectInitializer:
         config = json.loads(self.config_path.read_text())
         self.project_name = config.get("project_name")
         self.repo_org = config.get("repo_org")
-        self.github_host = config.get("github_host", "github.com")
+        self.github_host = config.get("github_host", "github.com")  # Support custom GitHub hosts
         self.repositories = config.get("repositories", [])
         
         # Make sure we have all required settings
         if not all([self.project_name, self.repo_org, self.repositories]):
             print("❌ Missing required configuration in .gproj file")
             sys.exit(1)
+
+        # Add the base repository to the list if not present
+        base_repo_name = Path.cwd().name
+        if not any(repo["name"] == base_repo_name for repo in self.repositories):
+            self.repositories.append({"name": base_repo_name})
             
-        # Set up paths and limits
+        # Set up paths and rate limiting
         self.base_dir = Path("..").resolve()
-        self.semaphore = asyncio.Semaphore(5)
+        self.semaphore = asyncio.Semaphore(5)  # Limit concurrent operations
 
     async def clone_repo(self, repo: Dict[str, str]) -> bool:
         """Clone or update a project repository."""
@@ -401,6 +369,8 @@ async def handle_git_operations(initializer: ProjectInitializer, args: argparse.
     1. Add specific files or all changes
     2. Commit changes with a message
     3. Push changes to a specific branch
+    4. Switch or create branches as needed
+    5. Create empty commits for repos without changes
     
     Args:
         initializer: The ProjectInitializer instance
@@ -493,6 +463,61 @@ async def handle_git_operations(initializer: ProjectInitializer, args: argparse.
         except Exception as e:
             print(f"❌ Error processing {repo_name}: {str(e)}")
 
+async def handle_pull_requests(initializer: ProjectInitializer, args: argparse.Namespace) -> None:
+    """
+    Create pull requests across repositories that have changes in the specified branch.
+    
+    Args:
+        initializer: The ProjectInitializer instance
+        args: Command line arguments containing:
+             - pr: Title for pull requests
+             - branch: Source branch
+             - base: Target branch
+             - message: Pull request description
+             - exclude: List of repositories to skip
+    """
+    excluded_repos = set(args.exclude or [])
+    
+    for repo in initializer.repositories:
+        repo_name = repo["name"]
+        if repo_name in excluded_repos:
+            continue
+            
+        repo_dir = initializer.base_dir / repo_name
+        if not repo_dir.exists():
+            continue
+        
+        try:
+            print(f"\n📁 Repository: {repo_name}")
+            
+            # Check out the source branch
+            process = await asyncio.create_subprocess_exec(
+                "git", "-C", str(repo_dir), "checkout", args.branch,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE
+            )
+            await process.communicate()
+            
+            # Create the pull request
+            process = await asyncio.create_subprocess_exec(
+                "gh", "pr", "create",
+                "--title", args.pr,
+                "--body", args.message,
+                "--base", args.base,
+                "--head", args.branch,
+                cwd=str(repo_dir),
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE
+            )
+            stdout, stderr = await process.communicate()
+            if process.returncode != 0:
+                print(f"❌ Failed to create pull request for {repo_name}: {stderr.decode()}")
+            else:
+                print(f"✅ Pull request created for {repo_name}: {stdout.decode()}")
+                
+        except Exception as e:
+            print(f"❌ Error processing {repo_name}: {str(e)}")
+
 def main():
     """
     Main entry point for the script.
@@ -502,13 +527,21 @@ def main():
     """
     # Set up command line argument parser
     parser = argparse.ArgumentParser(
-        description="Initialize or nuke project workspace",
-        epilog="Example: ./gproj --nuke  # Backup and remove all repositories"
+        description="Project repository management tool",
+        epilog="""Examples:
+  ./gproj                                       # Clone/update all repositories
+  ./gproj --commit -m "your message"           # Commit changes in all repos
+  ./gproj --commit -m "message" --push         # Commit and push changes
+  ./gproj --branch feature/new --commit -m "message" --push  # Work with branches
+  ./gproj --pr "title" -m "description" --base main         # Create PRs across repos
+  ./gproj --nuke                               # Backup and remove all repositories"""
     )
+    
+    # Existing arguments
     parser.add_argument("--debug", action="store_true", help="Enable debug output")
     parser.add_argument("--nuke", action="store_true", 
                        help="Remove all repositories (after creating backup branches)")
-    parser.add_argument("--branch", help="Branch name for push operation")
+    parser.add_argument("--branch", help="Branch to work with (will create if doesn't exist)")
     parser.add_argument("--exclude", nargs="+", 
                        help="Exclude specific repositories")
     parser.add_argument("--commit", action="store_true",
@@ -516,9 +549,15 @@ def main():
     parser.add_argument("--push", action="store_true",
                        help="Push changes to remote repositories")
     parser.add_argument("--message", "-m",
-                       help="Commit message when using --commit")
+                       help="Commit message or PR description when using --commit or --pr")
     parser.add_argument("--files", nargs="+",
                        help="Specific files to commit when using --commit")
+
+    # New arguments for pull request creation
+    parser.add_argument("--pr", metavar="title",
+                       help="Create pull requests with the given title")
+    parser.add_argument("--base", default="main",
+                       help="Base branch for pull requests (default: main)")
     
     args = parser.parse_args()
     initializer = ProjectInitializer()
@@ -532,8 +571,17 @@ def main():
             "repositories": initializer.repositories
         }, indent=2))
 
+    # Handle PR creation if specified
+    if args.pr:
+        if not args.branch:
+            print("❌ --branch is required for pull request creation")
+            sys.exit(1)
+        if not args.message:
+            print("❌ --message is required for pull request description")
+            sys.exit(1)
+        asyncio.run(handle_pull_requests(initializer, args))
     # Handle Git operations if specified
-    if args.commit or args.push:
+    elif args.commit or args.push:
         if args.commit and not args.message:
             print("❌ --message is required for commit operation")
             sys.exit(1)
