@@ -15,9 +15,10 @@ resource "aws_ssm_parameter" "morpheus_endpoints" {
   for_each = {
     aurora     = module.aurora.cluster_endpoint
     aurora_ro  = module.aurora.cluster_reader_endpoint
-    rabbitmq   = module.rabbitmq.endpoint
-    opensearch = module.opensearch.endpoint
+    rabbitmq   = module.rabbitmq.broker_endpoint
+    opensearch = module.opensearch.domain_endpoint
     efs_id     = module.efs.id
+    redis      = module.redis.endpoint
   }
 
   name        = "${local.parameter_prefix}/endpoints/${each.key}"
@@ -66,12 +67,10 @@ resource "aws_secretsmanager_secret" "morpheus_db" {
 }
 
 resource "aws_secretsmanager_secret_version" "morpheus_db" {
-  secret_id = aws_secretsmanager_secret.morpheus_db.id
+  secret_id = aws_secretsmanager_secret.database.id
   secret_string = jsonencode({
-    username = module.aurora.master_username
-    password = module.aurora.master_password
-    database = "morpheus"
-    port     = 3306
+    username = "morpheus"
+    password = random_password.database.result
   })
 }
 
@@ -90,11 +89,79 @@ resource "aws_secretsmanager_secret" "morpheus_rabbitmq" {
 resource "aws_secretsmanager_secret_version" "morpheus_rabbitmq" {
   secret_id = aws_secretsmanager_secret.morpheus_rabbitmq.id
   secret_string = jsonencode({
-    username = module.rabbitmq.username
-    password = module.rabbitmq.password
+    username = "morpheus"
+    password = random_password.rabbitmq.result
     vhost    = "/"
     port     = 5671
   })
+}
+
+# Secrets for Morpheus components
+resource "aws_secretsmanager_secret" "rabbitmq" {
+  name_prefix = "${local.project}/${var.environment}/rabbitmq"
+  kms_key_id  = aws_kms_key.morpheus.arn
+  tags        = local.tags
+}
+
+resource "aws_secretsmanager_secret" "database" {
+  name_prefix = "${local.project}/${var.environment}/database"
+  kms_key_id  = aws_kms_key.morpheus.arn
+  tags        = local.tags
+}
+
+resource "aws_secretsmanager_secret" "ssl_cert" {
+  name_prefix = "${local.project}/${var.environment}/ssl"
+  kms_key_id  = aws_kms_key.morpheus.arn
+  tags        = local.tags
+}
+
+resource "aws_secretsmanager_secret" "redis" {
+  name_prefix = "${local.project}/${var.environment}/redis"
+  kms_key_id  = aws_kms_key.morpheus.arn
+  tags        = local.tags
+}
+
+# Initial secret values
+resource "aws_secretsmanager_secret_version" "rabbitmq" {
+  secret_id = aws_secretsmanager_secret.rabbitmq.id
+  secret_string = jsonencode({
+    username = "morpheus"
+    password = random_password.rabbitmq.result
+  })
+}
+
+resource "aws_secretsmanager_secret_version" "database" {
+  secret_id = aws_secretsmanager_secret.database.id
+  secret_string = jsonencode({
+    username = "morpheus"
+    password = random_password.database.result
+  })
+}
+
+resource "aws_secretsmanager_secret_version" "redis" {
+  secret_id = aws_secretsmanager_secret.redis.id
+  secret_string = jsonencode({
+    auth_token = random_password.redis.result
+  })
+}
+
+# Random passwords for services
+resource "random_password" "rabbitmq" {
+  length           = 32
+  special          = true
+  override_special = "!#$%&*()-_=+[]{}<>:?"
+}
+
+resource "random_password" "database" {
+  length           = 32
+  special          = true
+  override_special = "!#$%&*()-_=+[]{}<>:?"
+}
+
+resource "random_password" "redis" {
+  length           = 32
+  special          = true
+  override_special = "!#$%&*()-_=+[]{}<>:?"
 }
 
 # KMS Key Policy for Secrets

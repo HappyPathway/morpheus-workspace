@@ -76,6 +76,90 @@ data "aws_iam_policy_document" "kms_key_policy" {
       values   = ["elasticfilesystem.${data.aws_region.current.name}.amazonaws.com"]
     }
   }
+
+  # Redis encryption
+  statement {
+    sid    = "Allow Redis Encryption"
+    effect = "Allow"
+    principals {
+      type        = "AWS"
+      identifiers = [module.cluster.instance_role_arn]
+    }
+    actions = [
+      "kms:Decrypt",
+      "kms:GenerateDataKey"
+    ]
+    resources = ["*"]
+    condition {
+      test     = "StringEquals"
+      variable = "kms:ViaService"
+      values   = ["elasticache.${data.aws_region.current.name}.amazonaws.com"]
+    }
+  }
+
+  statement {
+    sid    = "Allow SSM service to use the key"
+    effect = "Allow"
+    principals {
+      type = "Service"
+      identifiers = [
+        "ssm.${data.aws_region.current.name}.amazonaws.com"
+      ]
+    }
+    actions = [
+      "kms:Decrypt",
+      "kms:GenerateDataKey"
+    ]
+    resources = ["*"]
+  }
+
+  statement {
+    sid    = "Allow Secrets Manager to use the key"
+    effect = "Allow"
+    principals {
+      type = "Service"
+      identifiers = [
+        "secretsmanager.${data.aws_region.current.name}.amazonaws.com"
+      ]
+    }
+    actions = [
+      "kms:Decrypt",
+      "kms:GenerateDataKey"
+    ]
+    resources = ["*"]
+  }
+
+  statement {
+    sid    = "Allow EFS to use the key"
+    effect = "Allow"
+    principals {
+      type = "Service"
+      identifiers = [
+        "elasticfilesystem.${data.aws_region.current.name}.amazonaws.com"
+      ]
+    }
+    actions = [
+      "kms:Decrypt",
+      "kms:GenerateDataKey"
+    ]
+    resources = ["*"]
+  }
+
+  statement {
+    sid    = "Allow Redis service to use the key"
+    effect = "Allow"
+    principals {
+      type = "Service"
+      identifiers = [
+        "elasticache.${data.aws_region.current.name}.amazonaws.com"
+      ]
+    }
+    actions = [
+      "kms:Decrypt",
+      "kms:GenerateDataKey"
+    ]
+    resources = ["*"]
+  }
 }
 
 resource "aws_kms_alias" "morpheus" {

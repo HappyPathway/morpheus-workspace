@@ -87,24 +87,15 @@ output "efs_arn" {
 # Security outputs for IAM integration
 output "kms_key_id" {
   description = "ID of the KMS key used for encryption"
-  value       = module.kms.key_id
+  value       = aws_kms_key.morpheus.key_id
 }
 
 output "kms_key_arn" {
   description = "ARN of the KMS key used for encryption"
-  value       = module.kms.key_arn
+  value       = aws_kms_key.morpheus.arn
 }
 
-# Parameter and secrets path outputs
-output "parameter_prefix" {
-  description = "SSM Parameter Store prefix for Morpheus configuration"
-  value       = local.parameter_prefix
-}
-
-output "secrets_prefix" {
-  description = "Secrets Manager prefix for Morpheus secrets"
-  value       = local.secrets_prefix
-}
+# Remove duplicate outputs for parameter_prefix and secrets_prefix as they are defined in secrets.tf
 
 output "cluster_role_arn" {
   description = "ARN of the Morpheus cluster IAM role"

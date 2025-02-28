@@ -87,8 +87,61 @@ variable "redis_endpoint" {
   default     = null
 }
 
+variable "redis_instance_type" {
+  description = "Instance type for Redis cluster"
+  type        = string
+  default     = "cache.t3.medium"
+}
+
+variable "redis_nodes" {
+  description = "Number of nodes in Redis cluster"
+  type        = number
+  default     = 2
+}
+
 variable "environment" {
   description = "Environment name, used for resource naming and parameter/secret paths"
   type        = string
   default     = "dev"
+}
+
+variable "cluster_ami" {
+  description = "AMI configuration for Morpheus application nodes"
+  type = object({
+    most_recent = optional(bool, true)
+    owners      = optional(list(string), ["self"])
+    filters = optional(list(object({
+      name   = string
+      values = list(string)
+    })), [])
+  })
+}
+
+variable "parameter_prefix" {
+  description = "SSM Parameter Store prefix for Morpheus configuration"
+  type        = string
+  default     = "/morpheus"
+}
+
+variable "secrets_prefix" {
+  description = "Secrets Manager prefix for Morpheus secrets"
+  type        = string
+  default     = "/morpheus"
+}
+
+variable "morpheus_fqdn" {
+  description = "Fully qualified domain name for the Morpheus application"
+  type        = string
+}
+
+variable "log_level" {
+  description = "Log level for Morpheus application"
+  type        = string
+  default     = "INFO"
+}
+
+variable "backup_retention_days" {
+  description = "Number of days to retain backups"
+  type        = number
+  default     = 30
 }
