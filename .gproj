@@ -18,10 +18,6 @@
   "repo_org": "HappyPathway",
   "repositories": [
     {
-        "description": null,
-        "name": "."
-    },
-    {
       "description": null,
       "name": "terraform-aws-cluster"
     },

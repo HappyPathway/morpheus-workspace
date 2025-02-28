@@ -2,23 +2,23 @@
 
 ## Overview
 
-The Morpheus workspace implementation consists of a well-structured set of Terraform modules for deploying a highly available Morpheus application stack on AWS. The implementation follows infrastructure-as-code best practices and includes comprehensive security controls.
+The Morpheus workspace project is a meticulously crafted set of Terraform modules designed to deploy a highly available Morpheus application stack on AWS. This implementation adheres to infrastructure-as-code best practices and integrates robust security measures.
 
 ## Module Status
 
 ### Core Infrastructure (✅ Complete)
 
-- VPC and networking configuration
-- Multi-AZ deployment support
+- VPC and networking setup
+- Support for Multi-AZ deployments
 - NAT Gateways for private subnet connectivity
-- Security group definitions and rules
+- Defined security groups and rules
 - KMS encryption for sensitive data
 
 ### Application Layer (✅ Complete)
 
-- Auto-scaling group configuration
+- Auto-scaling group setup
 - Launch template with encrypted EBS volumes
-- Instance metadata service v2 enforcement
+- Enforced Instance Metadata Service v2
 - CloudWatch monitoring and logging
 - Health check endpoints
 
@@ -40,7 +40,7 @@ The Morpheus workspace implementation consists of a well-structured set of Terra
 
 ### Message Queue (✅ Complete)
 
-- RabbitMQ cluster configuration
+- RabbitMQ cluster setup
 - Multi-AZ deployment
 - TLS encryption
 - Access control
@@ -69,7 +69,7 @@ The Morpheus workspace implementation consists of a well-structured set of Terra
 - ✅ Secrets Manager for credentials
 - ✅ Security groups with minimal access
 - ✅ TLS for all service communications
-- ✅ Instance metadata service v2
+- ✅ Instance Metadata Service v2
 - ✅ IAM roles with least privilege
 
 ## Monitoring & Logging
